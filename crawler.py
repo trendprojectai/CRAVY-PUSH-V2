@@ -1,7 +1,7 @@
 
 import httpx
 import logging
-import asyncio
+import re
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
@@ -89,3 +89,51 @@ class MenuDiscoveryCrawler:
                     continue
                     
         return ""
+
+    async def extract_page_context(self, base_url: str) -> dict:
+        """Fetches a single page and extracts title, meta description, and first h1."""
+        if not base_url:
+            return {"page_title": "", "meta_description": "", "h1_heading": ""}
+
+        try:
+            async with httpx.AsyncClient(
+                headers=self.headers,
+                timeout=12.0,
+                follow_redirects=True
+            ) as client:
+                response = await client.get(base_url)
+        except Exception as e:
+            logger.debug(f"Context fetch error at {base_url}: {e}")
+            return {"page_title": "", "meta_description": "", "h1_heading": ""}
+
+        if response.status_code != 200:
+            return {"page_title": "", "meta_description": "", "h1_heading": ""}
+
+        content_type = response.headers.get("content-type", "").lower()
+        if "text/html" not in content_type:
+            return {"page_title": "", "meta_description": "", "h1_heading": ""}
+
+        base_domain = urlparse(base_url).netloc
+        final_domain = urlparse(str(response.url)).netloc
+        if base_domain and final_domain and base_domain != final_domain:
+            return {"page_title": "", "meta_description": "", "h1_heading": ""}
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        title_tag = soup.find("title")
+        page_title = title_tag.get_text(strip=True) if title_tag else ""
+
+        meta_description = ""
+        for meta in soup.find_all("meta"):
+            if meta.get("name", "").strip().lower() == "description":
+                meta_description = meta.get("content", "").strip()
+                break
+
+        h1_tag = soup.find("h1")
+        h1_heading = h1_tag.get_text(" ", strip=True) if h1_tag else ""
+
+        return {
+            "page_title": page_title,
+            "meta_description": meta_description,
+            "h1_heading": h1_heading
+        }

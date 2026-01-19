@@ -55,7 +55,8 @@ CSV_COLUMNS = [
     "price_level",
     "cover_image",
     "gallery_image_urls",
-    "menu_url"
+    "menu_url",
+    "description"
 ]
 
 CUISINE_MAPPING = {
@@ -82,6 +83,66 @@ def derive_cuisine(types: List[str]) -> str:
         if t in CUISINE_MAPPING:
             return CUISINE_MAPPING[t]
     return "Restaurant"
+
+def sanitize_one_line(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.replace("\r", " ").replace("\n", " ")).strip()
+
+def derive_context_phrase(context_text: str) -> str:
+    if not context_text:
+        return ""
+
+    keywords = [
+        (["menu", "menus"], "menu information"),
+        (["reservation", "reservations", "booking", "bookings"], "reservation details"),
+        (["delivery", "takeout", "takeaway", "pickup"], "takeout or delivery options"),
+        (["bar", "cocktail", "cocktails", "wine", "beer"], "bar service"),
+        (["cafe", "coffee", "espresso"], "coffee service"),
+        (["bakery", "pastry", "bake", "baked"], "baked goods"),
+        (["pizza"], "pizza offerings"),
+        (["sushi"], "sushi offerings"),
+        (["steak", "grill", "bbq", "barbecue"], "grill items")
+    ]
+
+    matches = []
+    for variants, phrase in keywords:
+        if any(word in context_text for word in variants):
+            matches.append(phrase)
+
+    if not matches:
+        return ""
+
+    trimmed = matches[:2]
+    return " and ".join(trimmed)
+
+def build_description(
+    category_name: str,
+    area: str,
+    city: str,
+    page_title: str,
+    meta_description: str,
+    h1_heading: str
+) -> str:
+    context_text = sanitize_one_line(" ".join([page_title, meta_description, h1_heading]).lower())
+    context_phrase = derive_context_phrase(context_text)
+    if context_phrase:
+        description = (
+            f"A {category_name} in {area}, {city} with a website that notes {context_phrase}."
+        )
+    else:
+        description = (
+            f"A {category_name} in {area}, {city} with a website listing basic venue information."
+        )
+
+    description = sanitize_one_line(description)
+    word_count = len(description.split())
+    if word_count < 12 or word_count > 25:
+        description = sanitize_one_line(
+            f"A {category_name} in {area}, {city} with a website listing basic venue information."
+        )
+
+    return description
 
 async def run_pipeline():
     api_key = os.getenv("GOOGLE_API_KEY")
@@ -118,7 +179,22 @@ async def run_pipeline():
 
         images = google.extract_images(details.get("photos", []))
         website = details.get("websiteUri", "")
+        category_name = derive_cuisine(details.get("types", []))
         menu_url = await crawler.find_menu(website) if website else ""
+        page_context = await crawler.extract_page_context(website) if website else {
+            "page_title": "",
+            "meta_description": "",
+            "h1_heading": ""
+        }
+        description = build_description(
+            category_name,
+            AREA_NAME,
+            CITY_NAME,
+            page_context.get("page_title", ""),
+            page_context.get("meta_description", ""),
+            page_context.get("h1_heading", "")
+        )
+        description = sanitize_one_line(description)
 
         results.append({
             "google_place_id": place_id,
@@ -130,7 +206,7 @@ async def run_pipeline():
             "city": CITY_NAME,
             "country": COUNTRY_NAME,
             "area": AREA_NAME,
-            "category_name": derive_cuisine(details.get("types", [])),
+            "category_name": category_name,
             "category": ",".join(details.get("types", [])),
             "website": website,
             "phone": details.get("nationalPhoneNumber", ""),
@@ -139,13 +215,18 @@ async def run_pipeline():
             "price_level": details.get("priceLevel"),
             "cover_image": images["hero_image_url"],
             "gallery_image_urls": json.dumps(images["gallery_image_urls"]),
-            "menu_url": menu_url
+            "menu_url": menu_url,
+            "description": description
         })
 
         await asyncio.sleep(0.25)
 
     with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(
+            f,
+            fieldnames=CSV_COLUMNS,
+            quoting=csv.QUOTE_ALL
+        )
         writer.writeheader()
         writer.writerows(results)
 
