@@ -1,9 +1,19 @@
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import os
 
 app = FastAPI()
+
+# ✅ THIS IS THE FIX
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # OK for internal admin tool
+    allow_credentials=True,
+    allow_methods=["*"],          # Allows OPTIONS, POST, GET
+    allow_headers=["*"],
+)
 
 CSV_FILENAME = "soho_restaurants_final.csv"
 
@@ -17,7 +27,7 @@ def health():
 def run_soho_import():
     """
     Runs the long job and writes the CSV to disk.
-    Returns JSON immediately after completion (no file download).
+    Returns JSON after completion.
     """
     try:
         process = subprocess.Popen(
@@ -27,7 +37,7 @@ def run_soho_import():
             text=True
         )
 
-        # Stream logs to Railway in real time
+        # Stream logs to Railway
         for line in process.stdout:
             print(line, end="")
 
@@ -45,7 +55,10 @@ def run_soho_import():
                 content={"status": "error", "message": "Run finished but CSV not found"}
             )
 
-        return {"status": "success", "message": f"Generated {CSV_FILENAME}"}
+        return {
+            "status": "success",
+            "message": f"Generated {CSV_FILENAME}"
+        }
 
     except Exception as e:
         return JSONResponse(
@@ -57,12 +70,15 @@ def run_soho_import():
 @app.get("/download-soho-csv")
 def download_soho_csv():
     """
-    Instant download endpoint. Only works if CSV exists.
+    Instant download endpoint.
     """
     if not os.path.exists(CSV_FILENAME):
         return JSONResponse(
             status_code=404,
-            content={"status": "not_ready", "message": "CSV not found yet. Run /run-soho-import first."}
+            content={
+                "status": "not_ready",
+                "message": "CSV not found yet. Run /run-soho-import first."
+            }
         )
 
     return FileResponse(
