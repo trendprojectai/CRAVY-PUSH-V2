@@ -13,6 +13,19 @@ from crawler import MenuDiscoveryCrawler
 load_dotenv()
 
 # -----------------------
+# CONFIG — CHANGE PER AREA
+# -----------------------
+AREA_NAME = "Soho"
+CITY_NAME = "London"
+COUNTRY_NAME = "UK"
+
+CENTER_LAT = 51.5136
+CENTER_LNG = -0.1331
+RADIUS_METERS = 1000
+
+SEARCH_QUERY = "restaurants"
+
+# -----------------------
 # LOGGING
 # -----------------------
 logging.basicConfig(
@@ -21,9 +34,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -----------------------
-# OUTPUT CONFIG (SUPABASE-READY)
-# -----------------------
 CSV_FILENAME = "soho_restaurants_final.csv"
 
 CSV_COLUMNS = [
@@ -33,9 +43,13 @@ CSV_COLUMNS = [
     "longitude",
     "address",
     "postcode",
+    "city",
+    "country",
+    "area",
     "category_name",
     "category",
     "website",
+    "phone",
     "rating",
     "reviews_count",
     "price_level",
@@ -44,9 +58,6 @@ CSV_COLUMNS = [
     "menu_url"
 ]
 
-# -----------------------
-# CUISINE MAPPING
-# -----------------------
 CUISINE_MAPPING = {
     "italian_restaurant": "Italian",
     "chinese_restaurant": "Chinese",
@@ -54,34 +65,13 @@ CUISINE_MAPPING = {
     "japanese_restaurant": "Japanese",
     "thai_restaurant": "Thai",
     "french_restaurant": "French",
-    "spanish_restaurant": "Spanish",
     "mexican_restaurant": "Mexican",
-    "middle_eastern_restaurant": "Middle Eastern",
     "american_restaurant": "American",
-    "mediterranean_restaurant": "Mediterranean",
-    "seafood_restaurant": "Seafood",
-    "steak_house": "Steakhouse",
-    "sushi_restaurant": "Sushi",
-    "vietnamese_restaurant": "Vietnamese",
-    "korean_restaurant": "Korean",
-    "greek_restaurant": "Greek",
-    "turkish_restaurant": "Turkish",
-    "brazilian_restaurant": "Brazilian",
     "pizza_restaurant": "Pizza",
-    "hamburger_restaurant": "Burgers",
-    "bakery": "Bakery",
     "cafe": "Cafe",
-    "wine_bar": "Wine Bar",
-    "pub": "Gastropub",
-    "brasserie": "Brasserie",
-    "lebanese_restaurant": "Lebanese",
-    "ethiopian_restaurant": "Ethiopian",
-    "israeli_restaurant": "Israeli"
+    "bakery": "Bakery",
 }
 
-# -----------------------
-# HELPERS
-# -----------------------
 def extract_postcode(address: str) -> str:
     pattern = r'([A-Z]{1,2}[0-9][0-9A-Z]?\s?[0-9][A-Z]{2})'
     match = re.search(pattern, address.upper())
@@ -93,9 +83,6 @@ def derive_cuisine(types: List[str]) -> str:
             return CUISINE_MAPPING[t]
     return "Restaurant"
 
-# -----------------------
-# PIPELINE
-# -----------------------
 async def run_pipeline():
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -105,18 +92,22 @@ async def run_pipeline():
     google = GooglePlacesClient(api_key)
     crawler = MenuDiscoveryCrawler()
 
-    logger.info("Step 1: Discovering Soho restaurants...")
-    raw_places = await google.text_search("restaurants in Soho London")
+    logger.info(f"Discovering restaurants in {AREA_NAME}, {CITY_NAME}...")
+    raw_places = await google.text_search(
+        SEARCH_QUERY,
+        CENTER_LAT,
+        CENTER_LNG,
+        RADIUS_METERS
+    )
 
     unique_places = {p["id"]: p for p in raw_places}
-    logger.info(f"Found {len(unique_places)} unique Soho locations.")
+    logger.info(f"Found {len(unique_places)} places.")
 
     results = []
-    total = len(unique_places)
 
     for idx, (place_id, summary) in enumerate(unique_places.items(), start=1):
         name = summary.get("displayName", {}).get("text", "Unknown")
-        logger.info(f"[{idx}/{total}] Enriching: {name}")
+        logger.info(f"[{idx}] Enriching {name}")
 
         details = await google.get_place_details(place_id)
         if not details:
@@ -125,37 +116,34 @@ async def run_pipeline():
         loc = details.get("location", {})
         address = details.get("formattedAddress", "")
 
-        photos = details.get("photos", [])
-        image_data = google.extract_images(photos)
-
+        images = google.extract_images(details.get("photos", []))
         website = details.get("websiteUri", "")
         menu_url = await crawler.find_menu(website) if website else ""
 
         results.append({
-            # --- SUPABASE COLUMN NAMES ---
             "google_place_id": place_id,
             "name": name,
             "latitude": loc.get("latitude"),
             "longitude": loc.get("longitude"),
             "address": address,
             "postcode": extract_postcode(address),
+            "city": CITY_NAME,
+            "country": COUNTRY_NAME,
+            "area": AREA_NAME,
             "category_name": derive_cuisine(details.get("types", [])),
             "category": ",".join(details.get("types", [])),
             "website": website,
+            "phone": details.get("nationalPhoneNumber", ""),
             "rating": details.get("rating"),
             "reviews_count": details.get("userRatingCount"),
             "price_level": details.get("priceLevel"),
-            "cover_image": image_data["hero_image_url"],
-            "gallery_image_urls": json.dumps(image_data["gallery_image_urls"]),
+            "cover_image": images["hero_image_url"],
+            "gallery_image_urls": json.dumps(images["gallery_image_urls"]),
             "menu_url": menu_url
         })
 
         await asyncio.sleep(0.25)
 
-    # -----------------------
-    # WRITE CSV (READY FOR SUPABASE)
-    # -----------------------
-    logger.info(f"Exporting {len(results)} rows...")
     with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
@@ -164,8 +152,5 @@ async def run_pipeline():
     await google.close()
     logger.info(f"✅ SUCCESS: Generated {CSV_FILENAME}")
 
-# -----------------------
-# ENTRY POINT
-# -----------------------
 if __name__ == "__main__":
     asyncio.run(run_pipeline())
