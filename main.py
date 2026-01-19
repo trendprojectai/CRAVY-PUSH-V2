@@ -4,8 +4,8 @@ import asyncio
 import logging
 import re
 import json
-from typing import List, Dict
 from dotenv import load_dotenv
+from typing import List
 
 from google_places import GooglePlacesClient
 from crawler import MenuDiscoveryCrawler
@@ -22,7 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -----------------------
-# OUTPUT CONFIG
+# OUTPUT CONFIG (SUPABASE-READY)
 # -----------------------
 CSV_FILENAME = "soho_restaurants_final.csv"
 
@@ -31,15 +31,15 @@ CSV_COLUMNS = [
     "name",
     "latitude",
     "longitude",
-    "address_full",
+    "address",
     "postcode",
-    "cuisine",
-    "categories",
+    "category_name",
+    "category",
     "website",
     "rating",
-    "review_count",
+    "reviews_count",
     "price_level",
-    "hero_image_url",
+    "cover_image",
     "gallery_image_urls",
     "menu_url"
 ]
@@ -108,7 +108,6 @@ async def run_pipeline():
     logger.info("Step 1: Discovering Soho restaurants...")
     raw_places = await google.text_search("restaurants in Soho London")
 
-    # Deduplicate
     unique_places = {p["id"]: p for p in raw_places}
     logger.info(f"Found {len(unique_places)} unique Soho locations.")
 
@@ -121,65 +120,42 @@ async def run_pipeline():
 
         details = await google.get_place_details(place_id)
         if not details:
-            logger.warning(f"Skipping {name} (no details)")
             continue
 
-        # Location
         loc = details.get("location", {})
-        lat = loc.get("latitude")
-        lng = loc.get("longitude")
-
-        # Address
         address = details.get("formattedAddress", "")
-        postcode = extract_postcode(address)
 
-        # Core metadata
-        website = details.get("websiteUri", "")
-        types = details.get("types", [])
-        cuisine = derive_cuisine(types)
-
-        # Reviews / ratings
-        rating = details.get("rating", "")
-        review_count = details.get("userRatingCount", "")
-        price_level = details.get("priceLevel", "")
-
-        # Images
         photos = details.get("photos", [])
         image_data = google.extract_images(photos)
-        hero_image_url = image_data["hero_image_url"]
-        gallery_image_urls = json.dumps(image_data["gallery_image_urls"])
 
-        # Menu discovery
-        menu_url = ""
-        if website:
-            menu_url = await crawler.find_menu(website)
-            if menu_url:
-                logger.info(f"   Menu detected: {menu_url}")
+        website = details.get("websiteUri", "")
+        menu_url = await crawler.find_menu(website) if website else ""
 
         results.append({
+            # --- SUPABASE COLUMN NAMES ---
             "google_place_id": place_id,
             "name": name,
-            "latitude": lat,
-            "longitude": lng,
-            "address_full": address,
-            "postcode": postcode,
-            "cuisine": cuisine,
-            "categories": ",".join(types),
+            "latitude": loc.get("latitude"),
+            "longitude": loc.get("longitude"),
+            "address": address,
+            "postcode": extract_postcode(address),
+            "category_name": derive_cuisine(details.get("types", [])),
+            "category": ",".join(details.get("types", [])),
             "website": website,
-            "rating": rating,
-            "review_count": review_count,
-            "price_level": price_level,
-            "hero_image_url": hero_image_url,
-            "gallery_image_urls": gallery_image_urls,
+            "rating": details.get("rating"),
+            "reviews_count": details.get("userRatingCount"),
+            "price_level": details.get("priceLevel"),
+            "cover_image": image_data["hero_image_url"],
+            "gallery_image_urls": json.dumps(image_data["gallery_image_urls"]),
             "menu_url": menu_url
         })
 
         await asyncio.sleep(0.25)
 
     # -----------------------
-    # WRITE CSV
+    # WRITE CSV (READY FOR SUPABASE)
     # -----------------------
-    logger.info(f"Exporting {len(results)} records to CSV...")
+    logger.info(f"Exporting {len(results)} rows...")
     with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
