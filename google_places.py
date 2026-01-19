@@ -45,12 +45,9 @@ class GooglePlacesClient:
         return {}
 
     # -----------------------------
-    # STEP 1: DISCOVER PLACES (SOHO)
+    # DISCOVER PLACES (AREA-AGNOSTIC)
     # -----------------------------
-    async def text_search(self, query: str) -> List[Dict[str, Any]]:
-        SOHO_LAT = 51.5136
-        SOHO_LNG = -0.1331
-
+    async def text_search(self, query: str, center_lat: float, center_lng: float, radius_m: float) -> List[Dict[str, Any]]:
         all_places = []
         page_token = None
 
@@ -71,8 +68,8 @@ class GooglePlacesClient:
                 "textQuery": query,
                 "locationBias": {
                     "circle": {
-                        "center": {"latitude": SOHO_LAT, "longitude": SOHO_LNG},
-                        "radius": 1000.0,
+                        "center": {"latitude": center_lat, "longitude": center_lng},
+                        "radius": radius_m,
                     }
                 },
             }
@@ -80,12 +77,7 @@ class GooglePlacesClient:
             if page_token:
                 body["pageToken"] = page_token
 
-            data = await self._request_with_retry(
-                "POST",
-                self.SEARCH_URL,
-                headers=headers,
-                json=body,
-            )
+            data = await self._request_with_retry("POST", self.SEARCH_URL, headers=headers, json=body)
 
             places = data.get("places", [])
             all_places.extend(places)
@@ -99,7 +91,7 @@ class GooglePlacesClient:
         return all_places
 
     # -----------------------------
-    # STEP 2: ENRICH PLACE DETAILS
+    # PLACE DETAILS (WITH PHONE)
     # -----------------------------
     async def get_place_details(self, place_id: str) -> Dict[str, Any]:
         url = self.DETAILS_URL.format(id=place_id)
@@ -117,14 +109,15 @@ class GooglePlacesClient:
                 "rating,"
                 "userRatingCount,"
                 "priceLevel,"
-                "photos"
+                "photos,"
+                "nationalPhoneNumber"
             ),
         }
 
         return await self._request_with_retry("GET", url, headers=headers)
 
     # -----------------------------
-    # STEP 3: IMAGE URL HELPERS
+    # IMAGES
     # -----------------------------
     def build_photo_url(self, photo_name: str, height: int = 1600) -> str:
         if not photo_name:
