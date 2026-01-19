@@ -1,0 +1,5 @@
+{
+  "name": "Soho Restaurant Data Engine",
+  "description": "A high-performance Python-based data collection engine and React dashboard for mapping every restaurant in Soho, London using the Google Places API (New) and custom web crawling.",
+  "requestFramePermissions": []
+}
