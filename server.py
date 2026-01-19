@@ -11,22 +11,28 @@ def health():
 @app.post("/run-soho-import")
 def run_soho_import():
     try:
-        # Run your existing script
-        result = subprocess.run(
+        process = subprocess.Popen(
             ["python", "main.py"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True
         )
 
-        if result.returncode != 0:
+        # Stream logs to Railway in real time
+        for line in process.stdout:
+            print(line, end="")
+
+        process.wait()
+
+        if process.returncode != 0:
             return {
                 "status": "error",
-                "stderr": result.stderr
+                "message": "Script failed — check logs"
             }
 
         return {
             "status": "success",
-            "stdout": result.stdout
+            "message": "Soho import completed — check logs"
         }
 
     except Exception as e:
