@@ -23,6 +23,20 @@ CENTER_LAT = 51.5136
 CENTER_LNG = -0.1331
 RADIUS_METERS = 1000
 
+SCAN_RADIUS_METERS = 350
+SOHO_SCAN_POINTS = [
+    (51.5152, -0.1321),  # North Soho
+    (51.5140, -0.1363),  # Northwest Soho
+    (51.5132, -0.1320),  # Central Soho
+    (51.5130, -0.1355),  # West Soho
+    (51.5122, -0.1327),  # South Central
+    (51.5120, -0.1357),  # Southwest Soho
+    (51.5128, -0.1297),  # East Soho
+    (51.5144, -0.1294),  # Northeast Soho
+    (51.5116, -0.1305),  # Southeast Soho
+    (51.5150, -0.1289),  # Far East Soho
+]
+
 SEARCH_QUERY = "restaurants"
 
 # -----------------------
@@ -121,15 +135,35 @@ async def run_pipeline():
     crawler = MenuDiscoveryCrawler()
 
     logger.info(f"Discovering restaurants in {AREA_NAME}, {CITY_NAME}...")
-    raw_places = await google.text_search(
-        SEARCH_QUERY,
-        CENTER_LAT,
-        CENTER_LNG,
-        RADIUS_METERS
-    )
+    unique_places: dict[str, dict] = {}
 
-    unique_places = {p["id"]: p for p in raw_places}
-    logger.info(f"Found {len(unique_places)} places.")
+    for idx, (lat, lng) in enumerate(SOHO_SCAN_POINTS, start=1):
+        logger.info(
+            "Running scan %s/%s at (%s, %s) with %sm radius",
+            idx,
+            len(SOHO_SCAN_POINTS),
+            lat,
+            lng,
+            SCAN_RADIUS_METERS
+        )
+        raw_places = await google.text_search(
+            SEARCH_QUERY,
+            lat,
+            lng,
+            SCAN_RADIUS_METERS
+        )
+
+        new_count = 0
+        for place in raw_places:
+            place_id = place.get("id")
+            if not place_id or place_id in unique_places:
+                continue
+            unique_places[place_id] = place
+            new_count += 1
+
+        logger.info("Scan %s added %s new places.", idx, new_count)
+
+    logger.info(f"Found {len(unique_places)} unique places across all scans.")
 
     results = []
 
