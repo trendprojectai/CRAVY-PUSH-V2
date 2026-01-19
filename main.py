@@ -1,33 +1,52 @@
-
 import os
 import csv
 import asyncio
 import logging
 import re
-from typing import List, Dict, Any
+import json
+from typing import List, Dict
 from dotenv import load_dotenv
 
-# Local imports
 from google_places import GooglePlacesClient
 from crawler import MenuDiscoveryCrawler
 
 load_dotenv()
 
-# Configure Logging
+# -----------------------
+# LOGGING
+# -----------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+# -----------------------
+# OUTPUT CONFIG
+# -----------------------
 CSV_FILENAME = "soho_restaurants_final.csv"
+
 CSV_COLUMNS = [
-    "google_place_id", "name", "latitude", "longitude", 
-    "address_full", "postcode", "cuisine", "categories", 
-    "website", "hero_image_url", "menu_url"
+    "google_place_id",
+    "name",
+    "latitude",
+    "longitude",
+    "address_full",
+    "postcode",
+    "cuisine",
+    "categories",
+    "website",
+    "rating",
+    "review_count",
+    "price_level",
+    "hero_image_url",
+    "gallery_image_urls",
+    "menu_url"
 ]
 
-# Enhanced cuisine mapping for London/Soho specific types
+# -----------------------
+# CUISINE MAPPING
+# -----------------------
 CUISINE_MAPPING = {
     "italian_restaurant": "Italian",
     "chinese_restaurant": "Chinese",
@@ -60,78 +79,84 @@ CUISINE_MAPPING = {
     "israeli_restaurant": "Israeli"
 }
 
+# -----------------------
+# HELPERS
+# -----------------------
 def extract_postcode(address: str) -> str:
-    """Extracts UK postcode using standard pattern (e.g., W1F 0RN)."""
-    # Pattern matches W1D, W1F, W1B, etc typical of Soho
-    pattern = r'([Gg][Ii][Rr] 0[Aa]{2})|((([A-Za-z][0-9]{1,2})|(([A-Za-z][A-Ha-hJ-Yj-y][0-9]{1,2})|(([A-Za-z][0-9][A-Za-z])|([A-Za-z][A-Ha-hJ-Yj-y][0-9][A-Za-z]?))))\s?[0-9][A-Za-z]{2})'
-    match = re.search(pattern, address)
+    pattern = r'([A-Z]{1,2}[0-9][0-9A-Z]?\s?[0-9][A-Z]{2})'
+    match = re.search(pattern, address.upper())
     return match.group(0) if match else ""
 
 def derive_cuisine(types: List[str]) -> str:
-    """Derives best-fit cuisine from Google Place types."""
     for t in types:
         if t in CUISINE_MAPPING:
             return CUISINE_MAPPING[t]
     return "Restaurant"
 
+# -----------------------
+# PIPELINE
+# -----------------------
 async def run_pipeline():
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        logger.error("GOOGLE_API_KEY missing. Update .env file.")
+        logger.error("❌ GOOGLE_API_KEY missing.")
         return
 
     google = GooglePlacesClient(api_key)
     crawler = MenuDiscoveryCrawler()
-    
-    logger.info("Step 1: Discovering all restaurants in Soho circle...")
+
+    logger.info("Step 1: Discovering Soho restaurants...")
     raw_places = await google.text_search("restaurants in Soho London")
-    
-    # Deduplicate by ID
-    unique_places = {}
-    for p in raw_places:
-        unique_places[p['id']] = p
-    
+
+    # Deduplicate
+    unique_places = {p["id"]: p for p in raw_places}
     logger.info(f"Found {len(unique_places)} unique Soho locations.")
 
-    final_results = []
-    processed_count = 0
+    results = []
     total = len(unique_places)
 
-    for place_id, summary in unique_places.items():
-        processed_count += 1
-        name = summary.get('displayName', {}).get('text', 'Unknown')
-        
-        logger.info(f"[{processed_count}/{total}] Enriching: {name}")
-        
-        # Step 2: Full Detail Fetch
+    for idx, (place_id, summary) in enumerate(unique_places.items(), start=1):
+        name = summary.get("displayName", {}).get("text", "Unknown")
+        logger.info(f"[{idx}/{total}] Enriching: {name}")
+
         details = await google.get_place_details(place_id)
         if not details:
-            logger.warning(f"Could not fetch details for {name}")
+            logger.warning(f"Skipping {name} (no details)")
             continue
-            
-        # Data Extraction
-        loc = details.get('location', {})
-        lat, lng = loc.get('latitude'), loc.get('longitude')
-        address = details.get('formattedAddress', '')
+
+        # Location
+        loc = details.get("location", {})
+        lat = loc.get("latitude")
+        lng = loc.get("longitude")
+
+        # Address
+        address = details.get("formattedAddress", "")
         postcode = extract_postcode(address)
-        website = details.get('websiteUri', '')
-        types = details.get('types', [])
+
+        # Core metadata
+        website = details.get("websiteUri", "")
+        types = details.get("types", [])
         cuisine = derive_cuisine(types)
-        
-        # Hero Image (First Photo)
-        hero_url = ""
-        photos = details.get('photos', [])
-        if photos:
-            hero_url = google.get_photo_url(photos[0].get('name'))
-        
-        # Step 3: Menu Discovery
+
+        # Reviews / ratings
+        rating = details.get("rating", "")
+        review_count = details.get("userRatingCount", "")
+        price_level = details.get("priceLevel", "")
+
+        # Images
+        photos = details.get("photos", [])
+        image_data = google.extract_images(photos)
+        hero_image_url = image_data["hero_image_url"]
+        gallery_image_urls = json.dumps(image_data["gallery_image_urls"])
+
+        # Menu discovery
         menu_url = ""
         if website:
             menu_url = await crawler.find_menu(website)
             if menu_url:
                 logger.info(f"   Menu detected: {menu_url}")
-        
-        final_results.append({
+
+        results.append({
             "google_place_id": place_id,
             "name": name,
             "latitude": lat,
@@ -141,25 +166,30 @@ async def run_pipeline():
             "cuisine": cuisine,
             "categories": ",".join(types),
             "website": website,
-            "hero_image_url": hero_url,
+            "rating": rating,
+            "review_count": review_count,
+            "price_level": price_level,
+            "hero_image_url": hero_image_url,
+            "gallery_image_urls": gallery_image_urls,
             "menu_url": menu_url
         })
-        
-        # Throttle to stay under 5 req/s (0.2s delay)
+
         await asyncio.sleep(0.25)
 
-    # Step 4: Final CSV Write
-    logger.info(f"Pipeline finished. Exporting {len(final_results)} records...")
-    with open(CSV_FILENAME, 'w', newline='', encoding='utf-8') as f:
+    # -----------------------
+    # WRITE CSV
+    # -----------------------
+    logger.info(f"Exporting {len(results)} records to CSV...")
+    with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
-        writer.writerows(final_results)
-    
-    await google.close()
-    logger.info(f"SUCCESS: Generated {CSV_FILENAME}")
+        writer.writerows(results)
 
+    await google.close()
+    logger.info(f"✅ SUCCESS: Generated {CSV_FILENAME}")
+
+# -----------------------
+# ENTRY POINT
+# -----------------------
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_pipeline())
-    except KeyboardInterrupt:
-        logger.info("Pipeline stopped by user.")
+    asyncio.run(run_pipeline())
