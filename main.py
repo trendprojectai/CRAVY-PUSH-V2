@@ -89,59 +89,26 @@ def sanitize_one_line(text: str) -> str:
         return ""
     return re.sub(r"\s+", " ", text.replace("\r", " ").replace("\n", " ")).strip()
 
-def derive_context_phrase(context_text: str) -> str:
-    if not context_text:
-        return ""
-
-    keywords = [
-        (["menu", "menus"], "menu information"),
-        (["reservation", "reservations", "booking", "bookings"], "reservation details"),
-        (["delivery", "takeout", "takeaway", "pickup"], "takeout or delivery options"),
-        (["bar", "cocktail", "cocktails", "wine", "beer"], "bar service"),
-        (["cafe", "coffee", "espresso"], "coffee service"),
-        (["bakery", "pastry", "bake", "baked"], "baked goods"),
-        (["pizza"], "pizza offerings"),
-        (["sushi"], "sushi offerings"),
-        (["steak", "grill", "bbq", "barbecue"], "grill items")
-    ]
-
-    matches = []
-    for variants, phrase in keywords:
-        if any(word in context_text for word in variants):
-            matches.append(phrase)
-
-    if not matches:
-        return ""
-
-    trimmed = matches[:2]
-    return " and ".join(trimmed)
-
-def build_description(
-    category_name: str,
+def generate_description_fallback(
+    name: str,
+    cuisine: str,
     area: str,
     city: str,
-    page_title: str,
-    meta_description: str,
-    h1_heading: str
+    price_level: str | None
 ) -> str:
-    context_text = sanitize_one_line(" ".join([page_title, meta_description, h1_heading]).lower())
-    context_phrase = derive_context_phrase(context_text)
-    if context_phrase:
-        description = (
-            f"A {category_name} in {area}, {city} with a website that notes {context_phrase}."
-        )
-    else:
-        description = (
-            f"A {category_name} in {area}, {city} with a website listing basic venue information."
-        )
-
+    description = f"{cuisine} restaurant in {area} {city} offering casual dining"
+    pricing_map = {
+        "PRICE_LEVEL_INEXPENSIVE": "with affordable pricing",
+        "PRICE_LEVEL_MODERATE": "with moderately priced dishes",
+        "PRICE_LEVEL_EXPENSIVE": "with an upscale dining style",
+        "PRICE_LEVEL_VERY_EXPENSIVE": "with a fine dining focus"
+    }
+    pricing_phrase = pricing_map.get(price_level)
+    if pricing_phrase:
+        description = f"{description} {pricing_phrase}"
     description = sanitize_one_line(description)
-    word_count = len(description.split())
-    if word_count < 12 or word_count > 25:
-        description = sanitize_one_line(
-            f"A {category_name} in {area}, {city} with a website listing basic venue information."
-        )
-
+    if not description.endswith("."):
+        description = f"{description}."
     return description
 
 async def run_pipeline():
@@ -181,20 +148,13 @@ async def run_pipeline():
         website = details.get("websiteUri", "")
         category_name = derive_cuisine(details.get("types", []))
         menu_url = await crawler.find_menu(website) if website else ""
-        page_context = await crawler.extract_page_context(website) if website else {
-            "page_title": "",
-            "meta_description": "",
-            "h1_heading": ""
-        }
-        description = build_description(
+        description = generate_description_fallback(
+            name,
             category_name,
             AREA_NAME,
             CITY_NAME,
-            page_context.get("page_title", ""),
-            page_context.get("meta_description", ""),
-            page_context.get("h1_heading", "")
+            details.get("priceLevel")
         )
-        description = sanitize_one_line(description)
 
         results.append({
             "google_place_id": place_id,
