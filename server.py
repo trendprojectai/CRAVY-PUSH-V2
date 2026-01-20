@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import os
+import json
 
 app = FastAPI()
 
@@ -16,6 +17,8 @@ app.add_middleware(
 )
 
 CSV_FILENAME = "soho_restaurants_final.csv"
+SCAN_HISTORY_FILENAME = "scan_history.json"
+SCAN_EVENTS_FILENAME = "scan_events.json"
 
 
 @app.get("/")
@@ -55,9 +58,26 @@ def run_soho_import():
                 content={"status": "error", "message": "Run finished but CSV not found"}
             )
 
+        scan_id = 0
+        new_found = 0
+        total_discovered = 0
+        if os.path.exists(SCAN_HISTORY_FILENAME):
+            try:
+                with open(SCAN_HISTORY_FILENAME, encoding="utf-8") as f:
+                    history = json.load(f)
+                if isinstance(history, list) and history:
+                    latest = history[-1]
+                    scan_id = latest.get("scan_number", 0)
+                    new_found = latest.get("new_found", 0)
+                    total_discovered = latest.get("total", 0)
+            except json.JSONDecodeError:
+                pass
+
         return {
-            "status": "success",
-            "message": f"Generated {CSV_FILENAME}"
+            "status": "complete",
+            "scan_id": scan_id,
+            "new_found": new_found,
+            "total_discovered": total_discovered
         }
 
     except Exception as e:
@@ -86,3 +106,22 @@ def download_soho_csv():
         media_type="text/csv",
         filename=CSV_FILENAME
     )
+
+
+@app.get("/scan-events")
+def get_scan_events():
+    if not os.path.exists(SCAN_EVENTS_FILENAME):
+        return []
+
+    events: list[dict] = []
+    with open(SCAN_EVENTS_FILENAME, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    return events
