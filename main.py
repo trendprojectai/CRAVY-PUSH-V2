@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import json
+import datetime
 from dotenv import load_dotenv
 from typing import List
 
@@ -49,6 +50,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 CSV_FILENAME = "soho_restaurants_final.csv"
+SCAN_HISTORY_FILENAME = "scan_history.json"
 
 CSV_COLUMNS = [
     "google_place_id",
@@ -125,6 +127,33 @@ def generate_description_fallback(
         description = f"{description}."
     return description
 
+def load_existing_places(csv_filename: str) -> dict[str, dict]:
+    if not os.path.exists(csv_filename):
+        return {}
+
+    with open(csv_filename, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        return {
+            row.get("google_place_id"): row
+            for row in reader
+            if row.get("google_place_id")
+        }
+
+def load_scan_history(history_filename: str) -> list[dict]:
+    if not os.path.exists(history_filename):
+        return []
+
+    try:
+        with open(history_filename, encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+def persist_scan_history(history_filename: str, history: list[dict]) -> None:
+    with open(history_filename, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=2)
+
 async def run_pipeline():
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
@@ -135,17 +164,15 @@ async def run_pipeline():
     crawler = MenuDiscoveryCrawler()
 
     logger.info(f"Discovering restaurants in {AREA_NAME}, {CITY_NAME}...")
-    unique_places: dict[str, dict] = {}
+    existing_places: dict[str, dict] = load_existing_places(CSV_FILENAME)
+    logger.info("Loaded %s existing restaurants.", len(existing_places))
+
+    scan_history = load_scan_history(SCAN_HISTORY_FILENAME)
+    next_scan_number = (scan_history[-1]["scan_number"] + 1) if scan_history else 1
+    total_new_found = 0
 
     for idx, (lat, lng) in enumerate(SOHO_SCAN_POINTS, start=1):
-        logger.info(
-            "Running scan %s/%s at (%s, %s) with %sm radius",
-            idx,
-            len(SOHO_SCAN_POINTS),
-            lat,
-            lng,
-            SCAN_RADIUS_METERS
-        )
+        logger.info("Scan %s/%s started", idx, len(SOHO_SCAN_POINTS))
         raw_places = await google.text_search(
             SEARCH_QUERY,
             lat,
@@ -156,64 +183,74 @@ async def run_pipeline():
         new_count = 0
         for place in raw_places:
             place_id = place.get("id")
-            if not place_id or place_id in unique_places:
+            if not place_id or place_id in existing_places:
                 continue
-            unique_places[place_id] = place
+
+            name = place.get("displayName", {}).get("text", "Unknown")
+            logger.info("NEW: %s", name)
+
+            details = await google.get_place_details(place_id)
+            if not details:
+                continue
+
+            loc = details.get("location", {})
+            address = details.get("formattedAddress", "")
+
+            images = google.extract_images(details.get("photos", []))
+            website = details.get("websiteUri", "")
+            category_name = derive_cuisine(details.get("types", []))
+            menu_url = await crawler.find_menu(website) if website else ""
+            description = generate_description_fallback(
+                name,
+                category_name,
+                AREA_NAME,
+                CITY_NAME,
+                details.get("priceLevel")
+            )
+
+            existing_places[place_id] = {
+                "google_place_id": place_id,
+                "name": name,
+                "latitude": loc.get("latitude"),
+                "longitude": loc.get("longitude"),
+                "address": address,
+                "postcode": extract_postcode(address),
+                "city": CITY_NAME,
+                "country": COUNTRY_NAME,
+                "area": AREA_NAME,
+                "category_name": category_name,
+                "category": ",".join(details.get("types", [])),
+                "website": website,
+                "phone": details.get("nationalPhoneNumber", ""),
+                "rating": details.get("rating"),
+                "reviews_count": details.get("userRatingCount"),
+                "price_level": details.get("priceLevel"),
+                "cover_image": images["hero_image_url"],
+                "gallery_image_urls": json.dumps(images["gallery_image_urls"]),
+                "menu_url": menu_url,
+                "description": description
+            }
+
             new_count += 1
+            total_new_found += 1
 
-        logger.info("Scan %s added %s new places.", idx, new_count)
+            await asyncio.sleep(0.25)
 
-    logger.info(f"Found {len(unique_places)} unique places across all scans.")
+        logger.info("Scan %s/%s complete — %s new restaurants", idx, len(SOHO_SCAN_POINTS), new_count)
 
-    results = []
+    total_restaurants = len(existing_places)
+    logger.info("Total restaurants known: %s", total_restaurants)
 
-    for idx, (place_id, summary) in enumerate(unique_places.items(), start=1):
-        name = summary.get("displayName", {}).get("text", "Unknown")
-        logger.info(f"[{idx}] Enriching {name}")
+    if total_new_found == 0:
+        logger.info("No new restaurants found — coverage likely complete")
 
-        details = await google.get_place_details(place_id)
-        if not details:
-            continue
-
-        loc = details.get("location", {})
-        address = details.get("formattedAddress", "")
-
-        images = google.extract_images(details.get("photos", []))
-        website = details.get("websiteUri", "")
-        category_name = derive_cuisine(details.get("types", []))
-        menu_url = await crawler.find_menu(website) if website else ""
-        description = generate_description_fallback(
-            name,
-            category_name,
-            AREA_NAME,
-            CITY_NAME,
-            details.get("priceLevel")
-        )
-
-        results.append({
-            "google_place_id": place_id,
-            "name": name,
-            "latitude": loc.get("latitude"),
-            "longitude": loc.get("longitude"),
-            "address": address,
-            "postcode": extract_postcode(address),
-            "city": CITY_NAME,
-            "country": COUNTRY_NAME,
-            "area": AREA_NAME,
-            "category_name": category_name,
-            "category": ",".join(details.get("types", [])),
-            "website": website,
-            "phone": details.get("nationalPhoneNumber", ""),
-            "rating": details.get("rating"),
-            "reviews_count": details.get("userRatingCount"),
-            "price_level": details.get("priceLevel"),
-            "cover_image": images["hero_image_url"],
-            "gallery_image_urls": json.dumps(images["gallery_image_urls"]),
-            "menu_url": menu_url,
-            "description": description
-        })
-
-        await asyncio.sleep(0.25)
+    scan_history.append({
+        "scan_number": next_scan_number,
+        "new_found": total_new_found,
+        "total": total_restaurants,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    })
+    persist_scan_history(SCAN_HISTORY_FILENAME, scan_history)
 
     with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
@@ -222,7 +259,7 @@ async def run_pipeline():
             quoting=csv.QUOTE_ALL
         )
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(existing_places.values())
 
     await google.close()
     logger.info(f"✅ SUCCESS: Generated {CSV_FILENAME}")
