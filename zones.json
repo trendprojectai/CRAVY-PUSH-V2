@@ -1,0 +1,12 @@
+[
+  {
+    "zone_id": "soho",
+    "zone_name": "Soho",
+    "center_lat": 51.5136,
+    "center_lng": -0.1331,
+    "radius_meters": 1000,
+    "scan_count": 0,
+    "total_discovered": 0,
+    "last_scanned_at": null
+  }
+]

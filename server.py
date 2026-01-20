@@ -16,9 +16,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CSV_FILENAME = "soho_restaurants_final.csv"
-SCAN_HISTORY_FILENAME = "scan_history.json"
+MASTER_CSV_FILENAME = "master_restaurants.csv"
+ZONES_FILENAME = "zones.json"
 SCAN_EVENTS_FILENAME = "scan_events.json"
+
+
+def load_zones() -> list[dict]:
+    if not os.path.exists(ZONES_FILENAME):
+        return []
+
+    try:
+        with open(ZONES_FILENAME, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def find_zone(zones: list[dict], zone_id: str | None) -> dict | None:
+    if not zone_id:
+        return None
+    for zone in zones:
+        if zone.get("zone_id") == zone_id:
+            return zone
+    return None
 
 
 @app.get("/")
@@ -26,15 +47,19 @@ def health():
     return {"status": "ok"}
 
 
-@app.post("/run-soho-import")
-def run_soho_import():
+@app.post("/run-zone-scan")
+def run_zone_scan(zone_id: str | None = None):
     """
     Runs the long job and writes the CSV to disk.
     Returns JSON after completion.
     """
     try:
+        command = ["python", "main.py"]
+        if zone_id:
+            command.extend(["--zone-id", zone_id])
+
         process = subprocess.Popen(
-            ["python", "main.py"],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True
@@ -52,32 +77,27 @@ def run_soho_import():
                 content={"status": "error", "message": "Script failed — check Railway logs"}
             )
 
-        if not os.path.exists(CSV_FILENAME):
+        if not os.path.exists(MASTER_CSV_FILENAME):
             return JSONResponse(
                 status_code=500,
-                content={"status": "error", "message": "Run finished but CSV not found"}
+                content={"status": "error", "message": "Run finished but master CSV not found"}
             )
 
-        scan_id = 0
-        new_found = 0
-        total_discovered = 0
-        if os.path.exists(SCAN_HISTORY_FILENAME):
-            try:
-                with open(SCAN_HISTORY_FILENAME, encoding="utf-8") as f:
-                    history = json.load(f)
-                if isinstance(history, list) and history:
-                    latest = history[-1]
-                    scan_id = latest.get("scan_number", 0)
-                    new_found = latest.get("new_found", 0)
-                    total_discovered = latest.get("total", 0)
-            except json.JSONDecodeError:
-                pass
+        zones = load_zones()
+        zone = find_zone(zones, zone_id)
+        if zone:
+            return {
+                "status": "complete",
+                "zone_id": zone.get("zone_id"),
+                "scan_id": zone.get("scan_count", 0),
+                "new_found": zone.get("last_scan_new_found", 0),
+                "total_discovered": zone.get("total_discovered", 0),
+                "likely_complete": zone.get("likely_complete", False)
+            }
 
         return {
             "status": "complete",
-            "scan_id": scan_id,
-            "new_found": new_found,
-            "total_discovered": total_discovered
+            "zones": zones
         }
 
     except Exception as e:
@@ -87,25 +107,49 @@ def run_soho_import():
         )
 
 
-@app.get("/download-soho-csv")
-def download_soho_csv():
+@app.post("/run-soho-import")
+def run_soho_import():
+    return run_zone_scan()
+
+
+@app.get("/download-zone-csv")
+def download_zone_csv(zone_id: str | None = None, scan_number: int | None = None):
     """
     Instant download endpoint.
     """
-    if not os.path.exists(CSV_FILENAME):
+    zones = load_zones()
+    zone = find_zone(zones, zone_id)
+    if zone and scan_number is None:
+        scan_number = zone.get("scan_count")
+
+    if zone and scan_number:
+        filename = f"zone_{zone.get('zone_id')}_scan_{scan_number}.csv"
+        if os.path.exists(filename):
+            return FileResponse(
+                path=filename,
+                media_type="text/csv",
+                filename=filename
+            )
+
+    if not os.path.exists(MASTER_CSV_FILENAME):
         return JSONResponse(
             status_code=404,
             content={
                 "status": "not_ready",
-                "message": "CSV not found yet. Run /run-soho-import first."
+                "message": "CSV not found yet. Run /run-zone-scan first."
             }
         )
 
     return FileResponse(
-        path=CSV_FILENAME,
+        path=MASTER_CSV_FILENAME,
         media_type="text/csv",
-        filename=CSV_FILENAME
+        filename=MASTER_CSV_FILENAME
     )
+
+
+@app.get("/download-soho-csv")
+def download_soho_csv():
+    return download_zone_csv()
 
 
 @app.get("/scan-events")
