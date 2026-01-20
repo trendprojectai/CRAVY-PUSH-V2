@@ -1,9 +1,14 @@
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import subprocess
+import asyncio
+import csv
 import os
 import json
+import re
+import subprocess
+
+import httpx
 
 app = FastAPI()
 
@@ -19,6 +24,7 @@ app.add_middleware(
 MASTER_CSV_FILENAME = "master_restaurants.csv"
 ZONES_FILENAME = "zones.json"
 SCAN_EVENTS_FILENAME = "scan_events.json"
+MAX_SUPABASE_BATCH_SIZE = 500
 
 
 def load_zones() -> list[dict]:
@@ -40,6 +46,122 @@ def find_zone(zones: list[dict], zone_id: str | None) -> dict | None:
         if zone.get("zone_id") == zone_id:
             return zone
     return None
+
+
+def get_latest_csv_filename() -> str | None:
+    csv_files = [
+        filename
+        for filename in os.listdir(".")
+        if filename.lower().endswith(".csv") and os.path.isfile(filename)
+    ]
+    if not csv_files:
+        return None
+    return max(csv_files, key=lambda filename: os.path.getmtime(filename))
+
+
+def parse_zone_name_from_filename(filename: str, zones: list[dict]) -> str | None:
+    match = re.search(r"zone_([^_]+)", filename.lower())
+    zone_id = match.group(1) if match else None
+    for zone in zones:
+        candidate_id = str(zone.get("zone_id", "")).lower()
+        if not candidate_id:
+            continue
+        if zone_id and candidate_id == zone_id:
+            return zone.get("zone_name")
+        if candidate_id in filename.lower():
+            return zone.get("zone_name")
+    return None
+
+
+def normalize_row(row: dict) -> dict:
+    def normalize_number(value: str, cast):
+        if value is None:
+            return None
+        value = value.strip()
+        if value == "":
+            return None
+        try:
+            return cast(value)
+        except ValueError:
+            return None
+
+    normalized = {key: (value.strip() if isinstance(value, str) else value) for key, value in row.items()}
+    for key in ("latitude", "longitude", "rating"):
+        normalized[key] = normalize_number(normalized.get(key), float)
+    for key in ("reviews_count", "price_level"):
+        normalized[key] = normalize_number(normalized.get(key), int)
+    for key, value in normalized.items():
+        if isinstance(value, str) and value == "":
+            normalized[key] = None
+    return normalized
+
+
+def read_csv_rows(csv_filename: str) -> list[dict]:
+    with open(csv_filename, newline="", encoding="utf-8") as file_handle:
+        reader = csv.DictReader(file_handle)
+        return [normalize_row(row) for row in reader]
+
+
+def chunk_rows(rows: list[dict], chunk_size: int) -> list[list[dict]]:
+    return [rows[index:index + chunk_size] for index in range(0, len(rows), chunk_size)]
+
+
+async def insert_restaurants(
+    client: httpx.AsyncClient,
+    supabase_url: str,
+    supabase_key: str,
+    rows: list[dict]
+) -> tuple[int, str | None]:
+    inserted_rows = 0
+    error_message = None
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=ignore-duplicates,return=representation"
+    }
+    endpoint = f"{supabase_url}/rest/v1/restaurants?on_conflict=google_place_id"
+    batches = chunk_rows(rows, MAX_SUPABASE_BATCH_SIZE)
+
+    for index, batch in enumerate(batches, start=1):
+        print(f"📤 Supabase batch {index}/{len(batches)}: inserting {len(batch)} rows", flush=True)
+        response = await client.post(endpoint, headers=headers, json=batch)
+        if response.status_code >= 400:
+            error_message = f"Batch {index} failed: {response.status_code} {response.text}"
+            print(f"❌ {error_message}", flush=True)
+            break
+
+        try:
+            inserted_rows += len(response.json())
+        except json.JSONDecodeError:
+            error_message = f"Batch {index} returned invalid JSON"
+            print(f"❌ {error_message}", flush=True)
+            break
+
+        await asyncio.sleep(0)
+
+    return inserted_rows, error_message
+
+
+async def log_push(
+    client: httpx.AsyncClient,
+    supabase_url: str,
+    supabase_key: str,
+    payload: dict
+) -> None:
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+    endpoint = f"{supabase_url}/rest/v1/csv_push_logs"
+    response = await client.post(endpoint, headers=headers, json=payload)
+    if response.status_code >= 400:
+        print(
+            f"⚠️ Failed to log push: {response.status_code} {response.text}",
+            flush=True
+        )
 
 
 @app.get("/")
@@ -169,3 +291,69 @@ def get_scan_events():
                 continue
 
     return events
+
+
+@app.post("/push-to-supabase")
+async def push_to_supabase():
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not supabase_url or not supabase_key:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "failed", "message": "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY"}
+        )
+
+    csv_filename = get_latest_csv_filename()
+    if not csv_filename:
+        return JSONResponse(
+            status_code=404,
+            content={"status": "failed", "message": "No CSV files found on disk"}
+        )
+
+    print(f"📄 Reading CSV: {csv_filename}", flush=True)
+    try:
+        rows = await asyncio.to_thread(read_csv_rows, csv_filename)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "failed", "message": f"Failed to read CSV: {exc}"}
+        )
+
+    total_rows = len(rows)
+    if total_rows == 0:
+        return {"status": "success", "total_rows": 0, "inserted_rows": 0, "skipped_rows": 0}
+
+    zones = load_zones()
+    zone_name = parse_zone_name_from_filename(csv_filename, zones)
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        inserted_rows, error_message = await insert_restaurants(
+            client,
+            supabase_url,
+            supabase_key,
+            rows
+        )
+
+        skipped_rows = max(total_rows - inserted_rows, 0)
+        if error_message:
+            status = "partial" if inserted_rows > 0 else "failed"
+        else:
+            status = "success" if skipped_rows == 0 else "partial"
+
+        log_payload = {
+            "csv_filename": os.path.basename(csv_filename),
+            "zone_name": zone_name,
+            "total_rows": total_rows,
+            "inserted_rows": inserted_rows,
+            "skipped_rows": skipped_rows,
+            "status": status,
+            "error_message": error_message
+        }
+        await log_push(client, supabase_url, supabase_key, log_payload)
+
+    return {
+        "status": status,
+        "total_rows": total_rows,
+        "inserted_rows": inserted_rows,
+        "skipped_rows": skipped_rows
+    }
