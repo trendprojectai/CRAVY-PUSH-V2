@@ -5,8 +5,13 @@ import logging
 import re
 import json
 import datetime
+import math
+import argparse
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from typing import List
 
 from google_places import GooglePlacesClient
 from crawler import MenuDiscoveryCrawler
@@ -14,31 +19,13 @@ from crawler import MenuDiscoveryCrawler
 load_dotenv()
 
 # -----------------------
-# CONFIG — CHANGE PER AREA
+# CONFIG
 # -----------------------
-AREA_NAME = "Soho"
-CITY_NAME = "London"
-COUNTRY_NAME = "UK"
-
-CENTER_LAT = 51.5136
-CENTER_LNG = -0.1331
-RADIUS_METERS = 1000
-
-SCAN_RADIUS_METERS = 350
-SOHO_SCAN_POINTS = [
-    (51.5152, -0.1321),  # North Soho
-    (51.5140, -0.1363),  # Northwest Soho
-    (51.5132, -0.1320),  # Central Soho
-    (51.5130, -0.1355),  # West Soho
-    (51.5122, -0.1327),  # South Central
-    (51.5120, -0.1357),  # Southwest Soho
-    (51.5128, -0.1297),  # East Soho
-    (51.5144, -0.1294),  # Northeast Soho
-    (51.5116, -0.1305),  # Southeast Soho
-    (51.5150, -0.1289),  # Far East Soho
-]
-
 SEARCH_QUERY = "restaurants"
+SCAN_RADIUS_METERS = 350
+ZONES_FILENAME = "zones.json"
+MASTER_CSV_FILENAME = "master_restaurants.csv"
+SCAN_EVENTS_FILENAME = "scan_events.json"
 
 # -----------------------
 # LOGGING
@@ -49,96 +36,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-CSV_FILENAME = "soho_restaurants_final.csv"
-SCAN_HISTORY_FILENAME = "scan_history.json"
-SCAN_EVENTS_FILENAME = "scan_events.json"
-
 CSV_COLUMNS = [
     "google_place_id",
     "name",
     "latitude",
     "longitude",
-    "address",
-    "postcode",
-    "city",
-    "country",
-    "area",
-    "category_name",
-    "category",
-    "website",
-    "phone",
+    "zone_id",
+    "discovered_at",
     "rating",
     "reviews_count",
     "price_level",
+    "website",
+    "menu_url",
     "cover_image",
     "gallery_image_urls",
-    "menu_url",
-    "description"
+    "logo_url"
 ]
 
-CUISINE_MAPPING = {
-    "italian_restaurant": "Italian",
-    "chinese_restaurant": "Chinese",
-    "indian_restaurant": "Indian",
-    "japanese_restaurant": "Japanese",
-    "thai_restaurant": "Thai",
-    "french_restaurant": "French",
-    "mexican_restaurant": "Mexican",
-    "american_restaurant": "American",
-    "pizza_restaurant": "Pizza",
-    "cafe": "Cafe",
-    "bakery": "Bakery",
-}
+def load_zones(zones_filename: str) -> list[dict]:
+    if not os.path.exists(zones_filename):
+        logger.error("❌ zones.json missing at %s", zones_filename)
+        return []
 
-def extract_postcode(address: str) -> str:
-    pattern = r'([A-Z]{1,2}[0-9][0-9A-Z]?\s?[0-9][A-Z]{2})'
-    match = re.search(pattern, address.upper())
-    return match.group(0) if match else ""
+    try:
+        with open(zones_filename, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except json.JSONDecodeError:
+        logger.error("❌ zones.json malformed")
+        return []
 
-def derive_cuisine(types: List[str]) -> str:
-    for t in types:
-        if t in CUISINE_MAPPING:
-            return CUISINE_MAPPING[t]
-    return "Restaurant"
-
-def sanitize_one_line(text: str) -> str:
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", text.replace("\r", " ").replace("\n", " ")).strip()
-
-def generate_description_fallback(
-    name: str,
-    cuisine: str,
-    area: str,
-    city: str,
-    price_level: str | None
-) -> str:
-    description = f"{cuisine} restaurant in {area} {city} offering casual dining"
-    pricing_map = {
-        "PRICE_LEVEL_INEXPENSIVE": "with affordable pricing",
-        "PRICE_LEVEL_MODERATE": "with moderately priced dishes",
-        "PRICE_LEVEL_EXPENSIVE": "with an upscale dining style",
-        "PRICE_LEVEL_VERY_EXPENSIVE": "with a fine dining focus"
-    }
-    pricing_phrase = pricing_map.get(price_level)
-    if pricing_phrase:
-        description = f"{description} {pricing_phrase}"
-    description = sanitize_one_line(description)
-    if not description.endswith("."):
-        description = f"{description}."
-    return description
-
-def load_existing_places(csv_filename: str) -> dict[str, dict]:
-    if not os.path.exists(csv_filename):
-        return {}
-
-    with open(csv_filename, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return {
-            row.get("google_place_id"): row
-            for row in reader
-            if row.get("google_place_id")
-        }
+def save_zones(zones_filename: str, zones: list[dict]) -> None:
+    with open(zones_filename, "w", encoding="utf-8") as f:
+        json.dump(zones, f, indent=2)
 
 def clear_scan_events(events_filename: str) -> None:
     with open(events_filename, "w", encoding="utf-8"):
@@ -148,157 +78,308 @@ def append_scan_event(events_filename: str, event: dict) -> None:
     with open(events_filename, "a", encoding="utf-8") as f:
         f.write(json.dumps(event) + "\n")
 
-def load_scan_history(history_filename: str) -> list[dict]:
-    if not os.path.exists(history_filename):
-        return []
+def load_existing_places(csv_filename: str) -> dict[str, dict]:
+    if not os.path.exists(csv_filename):
+        return {}
 
+    with open(csv_filename, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        existing: dict[str, dict] = {}
+        for row in reader:
+            place_id = row.get("google_place_id")
+            if not place_id:
+                continue
+            existing[place_id] = normalize_existing_row(row)
+        return existing
+
+def normalize_existing_row(row: dict) -> dict:
+    return {
+        "google_place_id": row.get("google_place_id", ""),
+        "name": row.get("name", ""),
+        "latitude": row.get("latitude"),
+        "longitude": row.get("longitude"),
+        "zone_id": row.get("zone_id", ""),
+        "discovered_at": row.get("discovered_at", ""),
+        "rating": row.get("rating"),
+        "reviews_count": row.get("reviews_count"),
+        "price_level": row.get("price_level"),
+        "website": row.get("website", ""),
+        "menu_url": row.get("menu_url", ""),
+        "cover_image": row.get("cover_image", ""),
+        "gallery_image_urls": row.get("gallery_image_urls", ""),
+        "logo_url": row.get("logo_url", "")
+    }
+
+def meters_to_lat(meters: float) -> float:
+    return meters / 111320
+
+def meters_to_lng(meters: float, lat: float) -> float:
+    denominator = 111320 * math.cos(math.radians(lat))
+    if denominator == 0:
+        return 0
+    return meters / denominator
+
+def generate_scan_points(
+    center_lat: float,
+    center_lng: float,
+    radius_meters: float,
+    scan_radius_meters: float
+) -> list[tuple[float, float]]:
+    step = max(scan_radius_meters * 1.4, 200)
+    points: list[tuple[float, float]] = []
+
+    for x in range(int(-radius_meters), int(radius_meters) + 1, int(step)):
+        for y in range(int(-radius_meters), int(radius_meters) + 1, int(step)):
+            if x * x + y * y > radius_meters * radius_meters:
+                continue
+            lat = center_lat + meters_to_lat(y)
+            lng = center_lng + meters_to_lng(x, center_lat)
+            points.append((lat, lng))
+
+    if not points:
+        points = [(center_lat, center_lng)]
+
+    return points
+
+def sanitize_one_line(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.replace("\r", " ").replace("\n", " ")).strip()
+
+def normalize_website(url: str) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.scheme:
+        return url
+    return f"https://{url}"
+
+async def url_has_image(client: httpx.AsyncClient, url: str) -> bool:
     try:
-        with open(history_filename, encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except json.JSONDecodeError:
-        return []
+        response = await client.head(url, follow_redirects=True)
+        if response.status_code == 405:
+            response = await client.get(url, follow_redirects=True, headers={"Range": "bytes=0-0"})
+    except Exception:
+        return False
 
-def persist_scan_history(history_filename: str, history: list[dict]) -> None:
-    with open(history_filename, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
+    if response.status_code >= 400:
+        return False
 
-async def run_pipeline():
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        logger.error("❌ GOOGLE_API_KEY missing.")
-        return
+    content_type = response.headers.get("content-type", "").lower()
+    return "image" in content_type
 
-    clear_scan_events(SCAN_EVENTS_FILENAME)
-    append_scan_event(
-        SCAN_EVENTS_FILENAME,
-        {
-            "type": "scan_start",
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-        }
-    )
+async def fetch_icon_from_html(client: httpx.AsyncClient, website: str) -> str:
+    try:
+        response = await client.get(website, follow_redirects=True)
+    except Exception:
+        return ""
 
-    google = GooglePlacesClient(api_key)
-    crawler = MenuDiscoveryCrawler()
+    if response.status_code >= 400:
+        return ""
 
-    logger.info(f"Discovering restaurants in {AREA_NAME}, {CITY_NAME}...")
-    existing_places: dict[str, dict] = load_existing_places(CSV_FILENAME)
-    logger.info("Loaded %s existing restaurants.", len(existing_places))
-    known_place_ids = set(existing_places.keys())
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/html" not in content_type:
+        return ""
 
-    scan_history = load_scan_history(SCAN_HISTORY_FILENAME)
-    next_scan_number = (scan_history[-1]["scan_number"] + 1) if scan_history else 1
-    total_new_found = 0
+    soup = BeautifulSoup(response.text, "html.parser")
+    for link in soup.find_all("link", href=True, rel=True):
+        rel_value = " ".join(link.get("rel", [])).lower()
+        if "icon" in rel_value:
+            href = link.get("href")
+            if href:
+                return urljoin(str(response.url), href)
 
-    for idx, (lat, lng) in enumerate(SOHO_SCAN_POINTS, start=1):
-        logger.info("Scan %s/%s started", idx, len(SOHO_SCAN_POINTS))
-        raw_places = await google.text_search(
-            SEARCH_QUERY,
-            lat,
-            lng,
-            SCAN_RADIUS_METERS
-        )
+    return ""
 
-        new_count = 0
-        for place in raw_places:
-            place_id = place.get("id")
-            if not place_id or place_id in known_place_ids:
-                continue
+async def fetch_logo_url(client: httpx.AsyncClient, website: str) -> str:
+    normalized = normalize_website(website)
+    if not normalized:
+        return ""
 
-            name = place.get("displayName", {}).get("text", "Unknown")
-            logger.info("NEW: %s", name)
+    favicon_url = urljoin(normalized.rstrip("/") + "/", "favicon.ico")
+    if await url_has_image(client, favicon_url):
+        return favicon_url
 
-            details = await google.get_place_details(place_id)
-            if not details:
-                continue
+    icon_url = await fetch_icon_from_html(client, normalized)
+    if icon_url and await url_has_image(client, icon_url):
+        return icon_url
 
-            loc = details.get("location", {})
-            address = details.get("formattedAddress", "")
+    return ""
 
-            images = google.extract_images(details.get("photos", []))
-            website = details.get("websiteUri", "")
-            category_name = derive_cuisine(details.get("types", []))
-            menu_url = await crawler.find_menu(website) if website else ""
-            description = generate_description_fallback(
-                name,
-                category_name,
-                AREA_NAME,
-                CITY_NAME,
-                details.get("priceLevel")
-            )
-
-            existing_places[place_id] = {
-                "google_place_id": place_id,
-                "name": name,
-                "latitude": loc.get("latitude"),
-                "longitude": loc.get("longitude"),
-                "address": address,
-                "postcode": extract_postcode(address),
-                "city": CITY_NAME,
-                "country": COUNTRY_NAME,
-                "area": AREA_NAME,
-                "category_name": category_name,
-                "category": ",".join(details.get("types", [])),
-                "website": website,
-                "phone": details.get("nationalPhoneNumber", ""),
-                "rating": details.get("rating"),
-                "reviews_count": details.get("userRatingCount"),
-                "price_level": details.get("priceLevel"),
-                "cover_image": images["hero_image_url"],
-                "gallery_image_urls": json.dumps(images["gallery_image_urls"]),
-                "menu_url": menu_url,
-                "description": description
-            }
-
-            append_scan_event(
-                SCAN_EVENTS_FILENAME,
-                {
-                    "type": "restaurant_found",
-                    "name": name,
-                    "place_id": place_id
-                }
-            )
-            known_place_ids.add(place_id)
-            new_count += 1
-            total_new_found += 1
-
-            await asyncio.sleep(0.25)
-
-        logger.info("Scan %s/%s complete — %s new restaurants", idx, len(SOHO_SCAN_POINTS), new_count)
-
-    total_restaurants = len(existing_places)
-    logger.info("Total restaurants known: %s", total_restaurants)
-
-    if total_new_found == 0:
-        logger.info("No new restaurants found — coverage likely complete")
-
-    scan_history.append({
-        "scan_number": next_scan_number,
-        "new_found": total_new_found,
-        "total": total_restaurants,
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
-    })
-    persist_scan_history(SCAN_HISTORY_FILENAME, scan_history)
-    append_scan_event(
-        SCAN_EVENTS_FILENAME,
-        {
-            "type": "scan_complete",
-            "new_found": total_new_found,
-            "total": total_restaurants
-        }
-    )
-
-    with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
+def ensure_csv(path: str, rows: list[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
             fieldnames=CSV_COLUMNS,
             quoting=csv.QUOTE_ALL
         )
         writer.writeheader()
-        writer.writerows(existing_places.values())
+        writer.writerows(rows)
+
+def count_zone_total(existing_places: dict[str, dict], zone_id: str) -> int:
+    return sum(1 for place in existing_places.values() if place.get("zone_id") == zone_id)
+
+async def run_zone_scan(zone_id: str | None = None) -> None:
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        logger.error("❌ GOOGLE_API_KEY missing.")
+        return
+
+    zones = load_zones(ZONES_FILENAME)
+    if not zones:
+        logger.error("❌ No zones available to scan.")
+        return
+
+    if zone_id:
+        zones = [zone for zone in zones if zone.get("zone_id") == zone_id]
+        if not zones:
+            logger.error("❌ Zone %s not found.", zone_id)
+            return
+
+    clear_scan_events(SCAN_EVENTS_FILENAME)
+    append_scan_event(
+        SCAN_EVENTS_FILENAME,
+        {
+            "type": "scan_start",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "zones": [zone.get("zone_id") for zone in zones]
+        }
+    )
+
+    google = GooglePlacesClient(api_key)
+    crawler = MenuDiscoveryCrawler()
+    favicon_client = httpx.AsyncClient(timeout=12.0, follow_redirects=True)
+
+    existing_places: dict[str, dict] = load_existing_places(MASTER_CSV_FILENAME)
+    known_place_ids = set(existing_places.keys())
+
+    for zone in zones:
+        zone_key = zone.get("zone_id")
+        if not zone_key:
+            continue
+
+        zone_new_places: list[dict] = []
+        zone_new_count = 0
+        logger.info("Running zone scanner for %s", zone_key)
+
+        scan_points = generate_scan_points(
+            zone.get("center_lat"),
+            zone.get("center_lng"),
+            zone.get("radius_meters"),
+            SCAN_RADIUS_METERS
+        )
+
+        for idx, (lat, lng) in enumerate(scan_points, start=1):
+            logger.info("Zone %s scan %s/%s started", zone_key, idx, len(scan_points))
+            raw_places = await google.text_search(
+                SEARCH_QUERY,
+                lat,
+                lng,
+                SCAN_RADIUS_METERS
+            )
+
+            for place in raw_places:
+                place_id = place.get("id")
+                if not place_id or place_id in known_place_ids:
+                    continue
+
+                name = place.get("displayName", {}).get("text", "Unknown")
+                logger.info("NEW: %s", name)
+
+                details = await google.get_place_details(place_id)
+                if not details:
+                    continue
+
+                loc = details.get("location", {})
+                website = sanitize_one_line(details.get("websiteUri", ""))
+
+                images = google.extract_images(details.get("photos", []))
+                menu_url = await crawler.find_menu(website) if website else ""
+                logo_url = await fetch_logo_url(favicon_client, website) if website else ""
+                discovered_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+                row = {
+                    "google_place_id": place_id,
+                    "name": name,
+                    "latitude": loc.get("latitude"),
+                    "longitude": loc.get("longitude"),
+                    "zone_id": zone_key,
+                    "discovered_at": discovered_at,
+                    "rating": details.get("rating"),
+                    "reviews_count": details.get("userRatingCount"),
+                    "price_level": details.get("priceLevel"),
+                    "website": website,
+                    "menu_url": menu_url,
+                    "cover_image": images["hero_image_url"],
+                    "gallery_image_urls": json.dumps(images["gallery_image_urls"]),
+                    "logo_url": logo_url or ""
+                }
+
+                existing_places[place_id] = row
+                zone_new_places.append(row)
+                known_place_ids.add(place_id)
+                zone_new_count += 1
+
+                append_scan_event(
+                    SCAN_EVENTS_FILENAME,
+                    {
+                        "type": "restaurant_found",
+                        "zone_id": zone_key,
+                        "name": name,
+                        "place_id": place_id
+                    }
+                )
+
+                await asyncio.sleep(0.25)
+
+            logger.info(
+                "Zone %s scan %s/%s complete — %s new restaurants",
+                zone_key,
+                idx,
+                len(scan_points),
+                zone_new_count
+            )
+
+        zone["scan_count"] = int(zone.get("scan_count", 0)) + 1
+        zone["last_scanned_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        zone["last_scan_new_found"] = zone_new_count
+        zone["total_discovered"] = count_zone_total(existing_places, zone_key)
+
+        recent_counts = zone.get("recent_new_counts", [])
+        if not isinstance(recent_counts, list):
+            recent_counts = []
+        recent_counts = (recent_counts + [zone_new_count])[-2:]
+        zone["recent_new_counts"] = recent_counts
+        zone["likely_complete"] = len(recent_counts) == 2 and all(count < 2 for count in recent_counts)
+
+        scan_filename = f"zone_{zone_key}_scan_{zone['scan_count']}.csv"
+        ensure_csv(scan_filename, zone_new_places)
+
+        append_scan_event(
+            SCAN_EVENTS_FILENAME,
+            {
+                "type": "zone_scan_complete",
+                "zone_id": zone_key,
+                "new_found": zone_new_count,
+                "total_discovered": zone["total_discovered"],
+                "scan_number": zone["scan_count"]
+            }
+        )
+
+    ensure_csv(MASTER_CSV_FILENAME, list(existing_places.values()))
+    save_zones(ZONES_FILENAME, zones)
 
     await google.close()
-    logger.info(f"✅ SUCCESS: Generated {CSV_FILENAME}")
+    await favicon_client.aclose()
+
+    logger.info("✅ SUCCESS: Generated %s", MASTER_CSV_FILENAME)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Zone scanner")
+    parser.add_argument("--zone-id", dest="zone_id", help="Zone id to scan")
+    return parser.parse_args()
 
 if __name__ == "__main__":
-    asyncio.run(run_pipeline())
+    args = parse_args()
+    asyncio.run(run_zone_scan(args.zone_id))
