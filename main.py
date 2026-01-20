@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 CSV_FILENAME = "soho_restaurants_final.csv"
 SCAN_HISTORY_FILENAME = "scan_history.json"
+SCAN_EVENTS_FILENAME = "scan_events.json"
 
 CSV_COLUMNS = [
     "google_place_id",
@@ -139,6 +140,14 @@ def load_existing_places(csv_filename: str) -> dict[str, dict]:
             if row.get("google_place_id")
         }
 
+def clear_scan_events(events_filename: str) -> None:
+    with open(events_filename, "w", encoding="utf-8"):
+        pass
+
+def append_scan_event(events_filename: str, event: dict) -> None:
+    with open(events_filename, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
 def load_scan_history(history_filename: str) -> list[dict]:
     if not os.path.exists(history_filename):
         return []
@@ -160,12 +169,22 @@ async def run_pipeline():
         logger.error("❌ GOOGLE_API_KEY missing.")
         return
 
+    clear_scan_events(SCAN_EVENTS_FILENAME)
+    append_scan_event(
+        SCAN_EVENTS_FILENAME,
+        {
+            "type": "scan_start",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
+    )
+
     google = GooglePlacesClient(api_key)
     crawler = MenuDiscoveryCrawler()
 
     logger.info(f"Discovering restaurants in {AREA_NAME}, {CITY_NAME}...")
     existing_places: dict[str, dict] = load_existing_places(CSV_FILENAME)
     logger.info("Loaded %s existing restaurants.", len(existing_places))
+    known_place_ids = set(existing_places.keys())
 
     scan_history = load_scan_history(SCAN_HISTORY_FILENAME)
     next_scan_number = (scan_history[-1]["scan_number"] + 1) if scan_history else 1
@@ -183,7 +202,7 @@ async def run_pipeline():
         new_count = 0
         for place in raw_places:
             place_id = place.get("id")
-            if not place_id or place_id in existing_places:
+            if not place_id or place_id in known_place_ids:
                 continue
 
             name = place.get("displayName", {}).get("text", "Unknown")
@@ -231,6 +250,15 @@ async def run_pipeline():
                 "description": description
             }
 
+            append_scan_event(
+                SCAN_EVENTS_FILENAME,
+                {
+                    "type": "restaurant_found",
+                    "name": name,
+                    "place_id": place_id
+                }
+            )
+            known_place_ids.add(place_id)
             new_count += 1
             total_new_found += 1
 
@@ -251,6 +279,14 @@ async def run_pipeline():
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     })
     persist_scan_history(SCAN_HISTORY_FILENAME, scan_history)
+    append_scan_event(
+        SCAN_EVENTS_FILENAME,
+        {
+            "type": "scan_complete",
+            "new_found": total_new_found,
+            "total": total_restaurants
+        }
+    )
 
     with open(CSV_FILENAME, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
